@@ -147,6 +147,36 @@ def test_run_exec_completion_raises_on_empty_text():
             raise AssertionError("expected RuntimeError")
 
 
+def test_harness_posture_mapping():
+    import os as _os
+    module, _ = _load_plugin()
+    for var in (module.ENV_APPROVAL_MODE, module.ENV_EXEC_APPROVAL,
+                module.ENV_NO_SANDBOX):
+        _os.environ.pop(var, None)
+    with patch.object(module, "_read_harness_approvals_mode",
+                      return_value="off"):
+        assert module._msp_approval_mode() == "allowAll"
+    with patch.object(module, "_read_harness_approvals_mode",
+                      return_value="on-request"):
+        assert module._msp_approval_mode() == "denyUnmatched"
+    with patch.object(module, "_read_harness_approvals_mode",
+                      return_value=None):
+        assert module._msp_approval_mode() is None
+    _os.environ[module.ENV_APPROVAL_MODE] = "promptUnmatched"
+    with patch.object(module, "_read_harness_approvals_mode",
+                      return_value="off"):
+        assert module._msp_approval_mode() == "promptUnmatched"
+    del _os.environ[module.ENV_APPROVAL_MODE]
+    assert module._exec_approval_flag() == ["--approval-mode", "never"]
+    _os.environ[module.ENV_EXEC_APPROVAL] = "on-request"
+    assert module._exec_approval_flag() == ["--approval-mode", "on-request"]
+    del _os.environ[module.ENV_EXEC_APPROVAL]
+    assert module._serve_extra_flags() == []
+    _os.environ[module.ENV_NO_SANDBOX] = "1"
+    assert module._serve_extra_flags() == ["--disable-sandbox"]
+    del _os.environ[module.ENV_NO_SANDBOX]
+
+
 def test_uuid7_shape():
     import re
     module, _ = _load_plugin()

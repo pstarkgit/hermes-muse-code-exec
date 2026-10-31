@@ -31,6 +31,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 ENV_COMMAND_VARS = ("HERMES_MUSE_CODE_EXEC_COMMAND", "MUSE_CLI_PATH")
+ENV_APPROVAL_MODE = "HERMES_MUSE_CODE_EXEC_APPROVAL_MODE"
+ENV_NO_SANDBOX = "HERMES_MUSE_CODE_EXEC_NO_SANDBOX"
+ENV_EXEC_APPROVAL = "HERMES_MUSE_CODE_EXEC_EXEC_APPROVAL"
 PROFILE_NAME = "muse-code-exec"
 EXEC_MARKER_BASE_URL = "exec://muse-code"
 
@@ -64,6 +67,66 @@ def resolve_command() -> str:
         if override:
             return override
     return shutil.which("muse") or "muse"
+
+
+def _harness_home() -> Path:
+    """The Hermes home whose config owns this turn's policy."""
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home())
+    except Exception:
+        override = os.getenv("HERMES_HOME", "").strip()
+        if override:
+            return Path(override)
+        return Path(os.path.expanduser("~")) / ".hermes"
+
+
+def _read_harness_approvals_mode() -> str | None:
+    """The harness's own approvals posture (`approvals.mode`), or None when
+    unreadable. The provider never invents policy; it only carries this."""
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+        cfg = load_user_config_effective(
+            _harness_home() / "config.yaml") or {}
+    except Exception:
+        return None
+    approvals = cfg.get("approvals")
+    mode = approvals.get("mode") if isinstance(approvals, dict) else None
+    return str(mode).strip().lower() or None
+
+
+def _msp_approval_mode() -> str | None:
+    """MSP session mode dictated by the harness. Explicit env wins; else the
+    profile's approvals.mode (off → allowAll, anything else → denyUnmatched);
+    None only when nothing is readable (caller then omits the field and the
+    host default applies)."""
+    override = os.getenv(ENV_APPROVAL_MODE, "").strip()
+    if override:
+        return override
+    harness = _read_harness_approvals_mode()
+    if harness is None:
+        return None
+    return "allowAll" if harness == "off" else "denyUnmatched"
+
+
+def _exec_approval_flag() -> list[str]:
+    """`muse exec` approval flag dictated by the harness. Explicit env wins;
+    else off → never; any stricter harness posture also resolves to never
+    because an exec turn cannot answer an interactive prompt (it denies
+    instead of hanging)."""
+    override = os.getenv(ENV_EXEC_APPROVAL, "").strip()
+    if override:
+        return ["--approval-mode", override]
+    return ["--approval-mode", "never"]
+
+
+def _serve_extra_flags() -> list[str]:
+    """Host flags dictated by the harness. Sandbox stays ON unless the
+    harness explicitly opts out via HERMES_MUSE_CODE_EXEC_NO_SANDBOX=1:
+    sandbox posture is a harness decision, never the model's."""
+    if os.getenv(ENV_NO_SANDBOX, "").strip() in ("1", "true", "yes"):
+        return ["--disable-sandbox"]
+    return []
 
 
 def _agent_cwd(exec_cwd: str | None) -> str:
@@ -120,9 +183,9 @@ def _render_messages(messages: list[dict]) -> str:
 def run_exec_completion(prompt_text: str, *, model: str | None, cwd: str,
                         timeout_seconds: float) -> str:
     """Fallback: one `muse exec --json` turn; return its final text."""
-    args = [resolve_command(), "exec", "--json",
-            "--disable-request-user-input", "--approval-mode", "never",
-            "--workspace", cwd]
+    args = ([resolve_command(), "exec", "--json",
+             "--disable-request-user-input"] + _exec_approval_flag() +
+            ["--workspace", cwd])
     requested = str(model or "").strip()
     if requested and requested != PROFILE_NAME:
         args += ["--model", requested]
@@ -204,8 +267,8 @@ def _answer_client_request(msg: dict[str, Any], *,
         process.stdin.write(json.dumps(_jsonrpc_error(
             msg.get("id"), -32601,
             f"muse-code-exec is non-interactive and denies {method!r}; "
-            "its sessions run denyUnmatched with request_user_input "
-            "withheld.")) + "\n")
+            "request_user_input is withheld and policy comes from the "
+            "harness approvals posture, never this session.")) + "\n")
         process.stdin.flush()
     except Exception:
         pass
@@ -326,7 +389,7 @@ def _msp_turn(prompt_text: str, *, model_id: str, cwd: str,
     try:
         proc = subprocess.Popen(
             [resolve_command(), "serve", "--disable-request-user-input",
-             "--no-session-log"],
+             "--no-session-log"] + _serve_extra_flags(),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8",
             errors="replace", bufsize=1, cwd=cwd, env=os.environ.copy())
@@ -342,18 +405,21 @@ def _msp_turn(prompt_text: str, *, model_id: str, cwd: str,
     session = _ServeSession(proc, deadline, on_release=lambda: None)
     try:
         session.request("initialize", {"clientInfo": {
-            "name": "hermes_muse_code_exec", "version": "0.2.1"}},
+            "name": "hermes_muse_code_exec", "version": "0.3.0"}},
             timeout=30.0)
         proc.stdin.write(json.dumps(
             {"jsonrpc": "2.0", "method": "initialized"}) + "\n")
         proc.stdin.flush()
         params: dict[str, Any] = {"commandId": uuid7(), "modelId": model_id,
-                                  "workspaceRoot": cwd,
-                                  "approvalMode": "denyUnmatched"}
+                                  "workspaceRoot": cwd}
+        harnessed = _msp_approval_mode()
+        if harnessed:
+            params["approvalMode"] = harnessed
         try:
             started = session.request("session/start", params)
         except RuntimeError as exc:
-            if "commandRejected" in str(exc) or "-32030" in str(exc):
+            if ("commandRejected" in str(exc) or "-32030" in str(exc)) \
+                    and "approvalMode" in params:
                 params = dict(params, commandId=uuid7())
                 params.pop("approvalMode", None)
                 started = session.request("session/start", params)

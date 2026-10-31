@@ -39,11 +39,23 @@ Sandbox stays ON, approval prompts are off (non-interactive), and
 The run uses its own tools internally; Hermes receives the final text.
 
 MSP upgrade (v0.2.0): each completion is one MSP turn on a fresh
-`muse serve` process (`initialize → initialized → session/start` in
-denyUnmatched mode → `turn/start` → live `item/delta` → `turn/completed`
-→ `session/leave`). Text deltas stream as they arrive and reasoning/tool
-items surface in the reasoning trace. If the MSP turn fails, the provider
-falls back to `muse exec` for the same prompt.
+`muse serve` process (`initialize → initialized → session/start` →
+`turn/start` → live `item/delta` → `turn/completed` → `session/leave`).
+Text deltas stream as they arrive and reasoning/tool items surface in the
+reasoning trace. If the MSP turn fails, the provider falls back to
+`muse exec` for the same prompt.
+
+Harness control (v0.3.0): sandbox and approval posture are harness
+decisions, never the model's. The provider reads the profile's own
+`approvals.mode`: `off` starts MSP sessions in `allowAll`, anything else
+in `denyUnmatched` (unreadable config falls back to omitting the field).
+`muse exec` runs `--approval-mode never` because an exec turn cannot
+answer an interactive prompt. Sandbox stays ON; only an explicit
+`HERMES_MUSE_CODE_EXEC_NO_SANDBOX=1` in the profile env adds
+`--disable-sandbox`. Explicit overrides:
+`HERMES_MUSE_CODE_EXEC_APPROVAL_MODE` (MSP session mode),
+`HERMES_MUSE_CODE_EXEC_EXEC_APPROVAL` (exec flag),
+`HERMES_MUSE_CODE_EXEC_COMMAND` / `MUSE_CLI_PATH` (binary).
 
 ## v1 limits
 
