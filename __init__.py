@@ -86,6 +86,16 @@ def login_healthy(timeout: float = 20.0) -> bool:
     return proc.returncode == 0
 
 
+TURN_PREAMBLE = (
+    "You are answering through Hermes via the muse-code-exec provider. "
+    "This turn has no Hermes-side tools: use your own tools only. "
+    "Never advise the user to disable sandboxes, approvals, or permission "
+    "profiles, and never claim a Hermes gateway setting changes this "
+    "session. If a task needs tools or permissions you lack, say so "
+    "plainly and stop."
+)
+
+
 def _render_messages(messages: list[dict]) -> str:
     """Flatten Hermes chat messages into one prompt for a fresh turn."""
     parts: list[str] = []
@@ -332,7 +342,7 @@ def _msp_turn(prompt_text: str, *, model_id: str, cwd: str,
     session = _ServeSession(proc, deadline, on_release=lambda: None)
     try:
         session.request("initialize", {"clientInfo": {
-            "name": "hermes_muse_code_exec", "version": "0.2.0"}},
+            "name": "hermes_muse_code_exec", "version": "0.2.1"}},
             timeout=30.0)
         proc.stdin.write(json.dumps(
             {"jsonrpc": "2.0", "method": "initialized"}) + "\n")
@@ -520,6 +530,7 @@ if _HERMES_AVAILABLE:
             prompt_text = _render_messages(list(messages or []))
             if not prompt_text.strip():
                 raise RuntimeError("muse-code-exec received an empty prompt.")
+            prompt_text = TURN_PREAMBLE + "\n\n" + prompt_text
             try:
                 budget = float(timeout) if timeout else 600.0
             except (TypeError, ValueError):

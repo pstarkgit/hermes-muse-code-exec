@@ -229,6 +229,14 @@ def test_dispatcher_routes_responses_and_notes():
         session.release()
 
 
+def test_turn_preamble_present_and_safe():
+    module, _ = _load_plugin()
+    assert "muse-code-exec" in module.TURN_PREAMBLE
+    lowered = module.TURN_PREAMBLE.lower()
+    assert "never advise" in lowered or "never instruct" in lowered
+    assert "disable sandbox" in lowered
+
+
 def test_model_id_passed_through():
     module, _ = _load_plugin()
     seen = {}
