@@ -464,3 +464,26 @@ def test_trace_distinguishes_confirmed_policy_from_an_actual_tool_denial():
     assert "approval=allowAll" in trace
     assert "tool=shell" in trace and "approval_denied" in trace and "deny_unmatched" in trace
     assert "private-content" not in trace
+
+
+def test_plugin_reload_replaces_only_the_bound_homes_cached_provider():
+    """Hermes's provider importer caches modules separately from PluginManager."""
+    import contextvars
+    module, _ = _load_plugin()
+    stale = object()
+    kira = SimpleNamespace(registry={module.PROFILE_NAME: stale})
+    other = SimpleNamespace(registry={module.PROFILE_NAME: stale})
+    target = contextvars.ContextVar("registration_target", default=None)
+    providers = types.ModuleType("providers")
+    providers._REGISTRATION_TARGET = target
+    providers._bound_home_layer = lambda: (kira, Path("kira"), "kira")
+
+    def register(profile):
+        target.get().registry[profile.name] = profile
+
+    with patch.dict(sys.modules, {"providers": providers}), \
+            patch.object(module, "register_provider", side_effect=register):
+        module.register(SimpleNamespace())
+    assert kira.registry[module.PROFILE_NAME] is module.muse_code_exec
+    assert other.registry[module.PROFILE_NAME] is stale
+    assert target.get() is None
