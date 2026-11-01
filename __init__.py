@@ -770,21 +770,8 @@ if _HERMES_AVAILABLE:
 
 
 def register(ctx) -> None:
-    """Refresh this home's provider when PluginManager hot-reloads the plugin."""
-    if not _HERMES_AVAILABLE:
-        return
-    import providers
-    # Hermes 0.22.x caches provider modules independently of PluginManager.
-    # A normal import registration is process-wide and is shadowed by the
-    # home's stale cached profile. Re-register into ONLY the bound home.
-    # Feature-detect this compatibility seam for older Hermes releases.
-    bound_layer = getattr(providers, "_bound_home_layer", None)
-    target = getattr(providers, "_REGISTRATION_TARGET", None)
-    if bound_layer is None or target is None:
-        return  # older registries already use the import-time registration
-    layer, _, _ = bound_layer()
-    token = target.set(layer)
-    try:
-        register_provider(muse_code_exec)
-    finally:
-        target.reset(token)
+    """PluginManager entry point (also required by `hermes plugins validate`).
+
+    Provider registration already happened at import; nothing cached to
+    refresh (the CLI owns auth per spawned process).
+    """

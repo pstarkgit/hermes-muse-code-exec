@@ -66,9 +66,6 @@ retried without that policy. The explicit sandbox override applies to both
 MSP and exec. Traces record the host-confirmed approval mode, sandbox launch
 setting, tool name/status and failure class, without raw tool arguments or
 failure text. Past transcript denials do not establish the new turn's access.
-On Hermes 0.22.x, PluginManager reload also refreshes the bound home's cached
-provider registration, so an updated adapter can take effect on subsequent
-turns without restarting a gateway that serves other active profiles.
 
 ## v1 limits
 
