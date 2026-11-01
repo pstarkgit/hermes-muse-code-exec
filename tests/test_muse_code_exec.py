@@ -281,3 +281,186 @@ def test_model_id_passed_through():
                                    cwd="/tmp", timeout_seconds=30)
     assert "--model" in seen["args"]
     assert "muse-spark-1.2" in seen["args"]
+
+
+def test_streaming_keeps_each_callers_profile_context():
+    """A multiplexed gateway's profile and frozen policy are ContextVars."""
+    import contextvars
+    from concurrent.futures import ThreadPoolExecutor
+    module, _ = _load_plugin()
+    profile = contextvars.ContextVar("test_profile", default="wrong-default")
+    client = module.MuseCodeExecClient(exec_cwd=str(REPO))
+
+    def run(prompt, **kwargs):
+        kwargs["on_delta"](profile.get())
+        return profile.get(), []
+
+    def reply(name):
+        token = profile.set(name)
+        try:
+            return "".join(chunk.choices[0].delta.content or "" for chunk in
+                           client._stream_turn("probe", model_id="test",
+                                               model_label="test", timeout_seconds=5))
+        finally:
+            profile.reset(token)
+
+    with patch.object(client, "_run_turn", side_effect=run):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(reply, ["kira", "other-profile"])) == ["kira", "other-profile"]
+
+
+def _fake_msp(module, on_request=None, notes=None):
+    """A deterministic host at the actual MSP transport seam; no inference."""
+    import io
+    from contextlib import ExitStack
+    requests = []
+    pending = list(notes or [
+        {"method": "item/completed", "params": {"sessionId": "s", "item": {
+            "kind": "agentMessage", "turnId": "t", "text": "ok"}}},
+        {"method": "turn/completed", "params": {
+            "sessionId": "s", "turnId": "t", "terminal": "completed"}},
+    ])
+
+    class Session:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def request(self, method, params, **kwargs):
+            requests.append((method, dict(params)))
+            if on_request:
+                result = on_request(method, params)
+                if result is not None:
+                    return result
+            if method == "session/start":
+                return {"session": {"sessionId": "s", "approvalMode": {"mode": "allowAll"}}}
+            if method == "turn/start":
+                return {"turnId": "t"}
+            return {}
+
+        def poll_note(self, timeout):
+            return pending.pop(0)
+
+    class Process:
+        stdin = io.StringIO()
+        stdout = []
+        stderr = []
+
+        def terminate(self):
+            pass
+
+        def wait(self, **kwargs):
+            pass
+
+    stack = ExitStack()
+    stack.enter_context(patch.object(module.subprocess, "Popen", return_value=Process()))
+    stack.enter_context(patch.object(module, "_ServeSession", Session))
+    stack.enter_context(patch.object(module, "_msp_approval_mode", return_value="allowAll"))
+    return stack, requests
+
+
+def test_rejected_policy_is_not_dropped_or_replayed_through_exec():
+    module, _ = _load_plugin()
+    client = module.MuseCodeExecClient(exec_cwd=str(REPO))
+
+    def reject(method, params):
+        if method == "session/start" and "approvalMode" in params:
+            raise RuntimeError("commandRejected -32030: approval mode unavailable")
+
+    host, requests = _fake_msp(module, on_request=reject)
+    with host, patch.object(module, "run_exec_completion", return_value="wrong fallback") as fallback:
+        try:
+            client._run_turn("probe", model_id="test", timeout_seconds=5, on_delta=None)
+        except RuntimeError as exc:
+            assert "approval" in str(exc).lower()
+        else:
+            raise AssertionError("Rejected approval policy was silently discarded")
+        assert len([r for r in requests if r[0] == "session/start"]) == 1
+        fallback.assert_not_called()
+
+
+def test_host_must_confirm_the_requested_approval_mode_before_tools_run():
+    module, _ = _load_plugin()
+    for actual in ("denyUnmatched", None):
+        def mismatch(method, params):
+            if method == "session/start":
+                session = {"sessionId": "s"}
+                if actual:
+                    session["approvalMode"] = {"mode": actual}
+                return {"session": session}
+
+        host, requests = _fake_msp(module, on_request=mismatch)
+        with host:
+            try:
+                module._msp_turn("probe", model_id="test", cwd=str(REPO),
+                                 timeout_seconds=5, on_delta=None, track=lambda *args: None)
+            except RuntimeError as exc:
+                assert "approval" in str(exc).lower()
+            else:
+                raise AssertionError(f"Unconfirmed approval policy {actual!r} admitted tools")
+        assert not any(method == "turn/start" for method, _ in requests)
+
+
+def test_exec_fallback_preserves_the_explicit_sandbox_setting():
+    module, _ = _load_plugin()
+    seen = []
+
+    def execute(args, **kwargs):
+        seen.append(args)
+        return SimpleNamespace(returncode=0, stdout=_jsonl(_term("ok")), stderr="")
+
+    with patch.dict(os.environ, {module.ENV_NO_SANDBOX: "1"}), \
+            patch.object(module.subprocess, "run", side_effect=execute):
+        module.run_exec_completion("probe", model="test", cwd=str(REPO), timeout_seconds=5)
+    assert "--disable-sandbox" in seen[0]
+    seen.clear()
+    with patch.dict(os.environ, {module.ENV_NO_SANDBOX: "0"}), \
+            patch.object(module.subprocess, "run", side_effect=execute):
+        module.run_exec_completion("probe", model="test", cwd=str(REPO), timeout_seconds=5)
+    assert "--disable-sandbox" not in seen[0]
+
+
+def test_an_admitted_turn_is_not_replayed_after_a_transport_failure():
+    module, _ = _load_plugin()
+    client = module.MuseCodeExecClient(exec_cwd=str(REPO))
+    host, _ = _fake_msp(module, notes=[
+        {"method": "item/completed", "params": {"sessionId": "s", "item": {
+            "kind": "toolCall", "tool": "shell", "status": "completed"}}},
+        {"method": "turn/failed", "params": {"sessionId": "s", "turnId": "t"}},
+    ])
+    with host, patch.object(module, "run_exec_completion", return_value="replayed") as fallback:
+        try:
+            client._run_turn("do work", model_id="test", timeout_seconds=5, on_delta=None)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("An admitted turn was silently executed again")
+        fallback.assert_not_called()
+
+
+def test_missing_approval_setting_is_not_the_string_none():
+    module, _ = _load_plugin()
+    config = types.ModuleType("hermes_cli.config_effective")
+    config.load_user_config_effective = lambda path: {}
+    with patch.dict(sys.modules, {"hermes_cli.config_effective": config}):
+        assert module._read_harness_approvals_mode() is None
+
+
+def test_trace_distinguishes_confirmed_policy_from_an_actual_tool_denial():
+    module, _ = _load_plugin()
+    host, _ = _fake_msp(module, notes=[
+        {"method": "item/completed", "params": {"sessionId": "s", "item": {
+            "kind": "toolCall", "tool": "shell", "status": "rejected",
+            "failureKind": "approval_denied",
+            "failureReason": "deny_unmatched: no policy rule allows this action private-content"}}},
+        {"method": "item/completed", "params": {"sessionId": "s", "item": {
+            "kind": "agentMessage", "turnId": "t", "text": "blocked"}}},
+        {"method": "turn/completed", "params": {
+            "sessionId": "s", "turnId": "t", "terminal": "completed"}},
+    ])
+    with host:
+        _, activity = module._msp_turn("probe", model_id="test", cwd=str(REPO),
+                                       timeout_seconds=5, on_delta=None, track=lambda *args: None)
+    trace = "\n".join(activity)
+    assert "approval=allowAll" in trace
+    assert "tool=shell" in trace and "approval_denied" in trace and "deny_unmatched" in trace
+    assert "private-content" not in trace
