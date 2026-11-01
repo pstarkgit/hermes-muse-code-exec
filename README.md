@@ -27,7 +27,9 @@ training on your data — your choice, in that order.
 
 ## How it works
 
-Each completion is one self-contained `muse exec --json` run:
+Each completion starts a fresh `muse serve` process and one MSP turn.
+If the transport fails before turn submission, it can fall back to one
+self-contained `muse exec --json` run:
 
 ```
 muse exec --json --disable-request-user-input --approval-mode never \
@@ -42,8 +44,8 @@ MSP upgrade (v0.2.0): each completion is one MSP turn on a fresh
 `muse serve` process (`initialize → initialized → session/start` →
 `turn/start` → live `item/delta` → `turn/completed` → `session/leave`).
 Text deltas stream as they arrive and reasoning/tool items surface in the
-reasoning trace. If the MSP turn fails, the provider falls back to
-`muse exec` for the same prompt.
+reasoning trace. Once a turn has been submitted, a failure is surfaced
+without automatic replay: tools may already have executed.
 
 Harness control (v0.3.0): sandbox and approval posture are harness
 decisions, never the model's. The provider reads the profile's own
@@ -57,11 +59,19 @@ answer an interactive prompt. Sandbox stays ON; only an explicit
 `HERMES_MUSE_CODE_EXEC_EXEC_APPROVAL` (exec flag),
 `HERMES_MUSE_CODE_EXEC_COMMAND` / `MUSE_CLI_PATH` (binary).
 
+Policy reliability (v0.3.1): streaming preserves the caller's context-local
+Hermes profile. The host must confirm a requested approval mode before the
+turn starts; a rejected or unconfirmed policy is reported explicitly, never
+retried without that policy. The explicit sandbox override applies to both
+MSP and exec. Traces record the host-confirmed approval mode, sandbox launch
+setting, tool name/status and failure class, without raw tool arguments or
+failure text. Past transcript denials do not establish the new turn's access.
+
 ## v1 limits
 
 - No Hermes-side tool loop: Hermes tool schemas are ignored (logged) and the
-  completion ends `stop` with final text. Upgrade path: speak MSP over
-  `muse serve` stdio for session continuity.
+  completion ends `stop` with final text. Each turn has a new Muse session;
+  Hermes supplies the conversation history.
 - One subprocess per completion (same cost profile as `copilot-acp`).
 - No vision payloads in v1.
 
@@ -78,6 +88,12 @@ answer an interactive prompt. Sandbox stays ON; only an explicit
 - **Empty prompt refusal** — Hermes sent no text; nothing was billed.
 - **Non-zero exit surfaced** — the tail of the CLI stderr is raised, never
   the key (the key never leaves the CLI process).
+- **`deny_unmatched`** — inspect the current turn's `policy:` and `toolCall:`
+  trace entries. An old denial in conversation history is not a fresh tool
+  result. A Hermes Bot Chat does not need replacing to apply a new Muse turn.
+- **Approval policy mismatch** — the adapter stopped before starting tools
+  because the host did not confirm the harness-selected policy. Inspect the
+  active profile's `approvals.mode` and any explicit adapter override.
 
 ## License
 

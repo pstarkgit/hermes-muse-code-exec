@@ -6,12 +6,12 @@ provider. Meta accepts the subscription key only from the Muse Code client
 (HTTP 403 otherwise), so this provider never touches the Model API.
 
 Transport: MSP over `muse serve` stdio first (live streaming, one process
-per turn, session in denyUnmatched approval mode, request_user_input
-withheld). Any MSP failure falls back to one `muse exec --json` run for the
-same turn, so a protocol regression never breaks the provider.
+per turn, harness-selected approval mode, request_user_input withheld).
+Only transport failures before turn submission may fall back to exec.
 """
 
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -36,6 +36,14 @@ ENV_NO_SANDBOX = "HERMES_MUSE_CODE_EXEC_NO_SANDBOX"
 ENV_EXEC_APPROVAL = "HERMES_MUSE_CODE_EXEC_EXEC_APPROVAL"
 PROFILE_NAME = "muse-code-exec"
 EXEC_MARKER_BASE_URL = "exec://muse-code"
+
+
+class MusePolicyError(RuntimeError):
+    """The host could not establish the harness-selected approval policy."""
+
+
+class MuseTurnError(RuntimeError):
+    """A turn may have executed tools and must not be automatically replayed."""
 
 # Standards first, then contributor tiers. Contributor bills to the sub too
 # (the attested CLI is allowed to use it), but it permits training on your
@@ -92,6 +100,8 @@ def _read_harness_approvals_mode() -> str | None:
         return None
     approvals = cfg.get("approvals")
     mode = approvals.get("mode") if isinstance(approvals, dict) else None
+    if mode is None:
+        return None
     return str(mode).strip().lower() or None
 
 
@@ -152,9 +162,13 @@ def login_healthy(timeout: float = 20.0) -> bool:
 TURN_PREAMBLE = (
     "You are answering through Hermes via the muse-code-exec provider. "
     "This turn has no Hermes-side tools: use your own tools only. "
+    "Each completion starts a fresh Muse process with harness-selected policy. "
+    "Previous permission failures do not prove that tools are blocked now. "
+    "Before reporting a current tool block, attempt the required tool in this "
+    "turn and report its actual error. "
     "Never advise the user to disable sandboxes, approvals, or permission "
-    "profiles, and never claim a Hermes gateway setting changes this "
-    "session. If a task needs tools or permissions you lack, say so "
+    "profiles or start a new chat to fix access. "
+    "If a task needs tools or permissions you lack, say so "
     "plainly and stop."
 )
 
@@ -185,7 +199,7 @@ def run_exec_completion(prompt_text: str, *, model: str | None, cwd: str,
     """Fallback: one `muse exec --json` turn; return its final text."""
     args = ([resolve_command(), "exec", "--json",
              "--disable-request-user-input"] + _exec_approval_flag() +
-            ["--workspace", cwd])
+            _serve_extra_flags() + ["--workspace", cwd])
     requested = str(model or "").strip()
     if requested and requested != PROFILE_NAME:
         args += ["--model", requested]
@@ -403,9 +417,10 @@ def _msp_turn(prompt_text: str, *, model_id: str, cwd: str,
     track(proc)
     deadline = time.monotonic() + max(float(timeout_seconds), 1.0)
     session = _ServeSession(proc, deadline, on_release=lambda: None)
+    turn_requested = False
     try:
         session.request("initialize", {"clientInfo": {
-            "name": "hermes_muse_code_exec", "version": "0.3.0"}},
+            "name": "hermes_muse_code_exec", "version": "0.3.1"}},
             timeout=30.0)
         proc.stdin.write(json.dumps(
             {"jsonrpc": "2.0", "method": "initialized"}) + "\n")
@@ -418,14 +433,20 @@ def _msp_turn(prompt_text: str, *, model_id: str, cwd: str,
         try:
             started = session.request("session/start", params)
         except RuntimeError as exc:
-            if ("commandRejected" in str(exc) or "-32030" in str(exc)) \
-                    and "approvalMode" in params:
-                params = dict(params, commandId=uuid7())
-                params.pop("approvalMode", None)
-                started = session.request("session/start", params)
-            else:
-                raise
-        session_id = started["session"]["sessionId"]
+            raise MusePolicyError(
+                f"Muse could not start with approval mode {harnessed!r}: {exc}") from exc
+        state = started["session"]
+        effective = (state.get("approvalMode") or {}).get("mode")
+        if harnessed and effective != harnessed:
+            raise MusePolicyError(
+                f"Muse approval policy mismatch: requested {harnessed!r}, "
+                f"host confirmed {effective!r}; no tools were started.")
+        logger.info("Muse MSP policy: profile=%s requested=%s effective=%s sandbox=%s",
+                    _harness_home().name, harnessed, effective,
+                    "disabled" if _serve_extra_flags() else "enabled")
+        session_id = state["sessionId"]
+        # Even a lost turn/start reply is ambiguous: the host may have admitted it.
+        turn_requested = True
         accepted = session.request("turn/start", {
             "commandId": uuid7(), "sessionId": session_id,
             "displayText": prompt_text[:200],
@@ -433,7 +454,8 @@ def _msp_turn(prompt_text: str, *, model_id: str, cwd: str,
         turn_id = str((accepted or {}).get("turnId") or "")
         deltas: dict[str, list[str]] = {}
         final_text: str | None = None
-        activity: list[str] = []
+        activity: list[str] = [f"policy: approval={effective or 'host-default'} "
+                               f"sandbox={'disabled' if _serve_extra_flags() else 'enabled'}"]
         ok = False
         while time.monotonic() < deadline:
             note = session.poll_note(
@@ -472,6 +494,14 @@ def _msp_turn(prompt_text: str, *, model_id: str, cwd: str,
                 elif kind and kind not in ("userMessage", "agentMessage"):
                     detail = str(item.get("status") or item.get("title")
                                   or "")[:120]
+                    if kind == "toolCall":
+                        detail += f" tool={str(item.get('tool') or 'unknown')[:80]}"
+                        if item.get("failureKind"):
+                            detail += f" failure={str(item['failureKind'])[:80]}"
+                        # Keep machine evidence, never raw arguments, output,
+                        # or arbitrary failure text that can contain secrets.
+                        if "deny_unmatched" in str(item.get("failureReason") or ""):
+                            detail += " deny_unmatched"
                     activity.append(f"{kind}: {detail}".rstrip(": "))
             elif method == "turn/completed":
                 if str(p.get("turnId") or "") not in (turn_id, ""):
@@ -498,6 +528,13 @@ def _msp_turn(prompt_text: str, *, model_id: str, cwd: str,
             session.request("session/leave", {
                 "commandId": uuid7(), "sessionId": session_id}, timeout=10.0)
         return text, [a for a in activity if a]
+    except MusePolicyError:
+        raise
+    except Exception as exc:
+        if turn_requested:
+            raise MuseTurnError(
+                f"Muse turn failed after submission; automatic replay was stopped: {exc}") from exc
+        raise
     finally:
         track(None, proc)
 
@@ -644,12 +681,15 @@ if _HERMES_AVAILABLE:
                       timeout_seconds: float,
                       on_delta: Callable[[str], None] | None
                       ) -> tuple[str, list[str]]:
-            """MSP first; exec fallback on any transport failure."""
+            """MSP first; exec fallback only before a turn can execute."""
             try:
                 return _msp_turn(
                     prompt_text, model_id=model_id, cwd=self._cwd,
                     timeout_seconds=timeout_seconds, on_delta=on_delta,
                     track=self._track_msp)
+            except (MusePolicyError, MuseTurnError):
+                # Preserve policy and any actions that may already have happened.
+                raise
             except Exception as exc:  # noqa: BLE001
                 logger.warning("muse-code-exec MSP turn failed (%s); "
                                "falling back to muse exec.", exc)
@@ -684,7 +724,10 @@ if _HERMES_AVAILABLE:
                     outcome["error"] = exc
                     chunks.put(("done", "error"))
 
-            thread = threading.Thread(target=_runner, daemon=True)
+            # Profile routing and frozen worker policy are context-local in a
+            # multiplexed gateway. A bare Thread reads the process default home.
+            context = contextvars.copy_context()
+            thread = threading.Thread(target=context.run, args=(_runner,), daemon=True)
             thread.start()
             while True:
                 kind, payload = chunks.get()
