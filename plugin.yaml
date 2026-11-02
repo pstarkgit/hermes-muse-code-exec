@@ -1,6 +1,6 @@
 name: muse-code-exec
 kind: model-provider
-version: 0.5.2
+version: 0.5.3
 description: Muse Spark in Hermes billed to the Muse Code monthly login via the attested CLI
 author: Elara
 license: MIT
