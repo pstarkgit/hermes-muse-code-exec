@@ -16,6 +16,7 @@ back to exec; the same host-tool contract survives that fallback.
 
 import contextlib
 import contextvars
+import hashlib
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -160,6 +161,15 @@ def _host_tools(tools: list[dict] | None) -> list[dict]:
     return selected
 
 
+def _native_context_digest(messages, system_text):
+    """Pin the already-submitted prefix without retaining another history copy."""
+    try:
+        encoded = json.dumps([system_text, messages], ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise MusePolicyError('Native context is not JSON; no context replay submitted.') from exc
+    return hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+
+
 class _HostToolMCP:
     """Finite per-completion MCP admission endpoint; never executes a tool.
 
@@ -180,6 +190,8 @@ class _HostToolMCP:
         self.lock = threading.Lock()
         self.wait_started = None
         self.wait_total = 0.0
+        self.steer_ready = threading.Event()
+        self.steer = None
         self.path = '/mcp/' + uuid.uuid4().hex
         owner = self
 
@@ -317,6 +329,7 @@ class _HostToolMCP:
             if self.closed.is_set():
                 return
             self.closed.set()
+            self.steer_ready.set()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=1)
@@ -640,7 +653,7 @@ class _ServeSession:
             self.notes.put(msg)
 
     def request(self, method: str, params: dict[str, Any],
-                timeout: float | None = None) -> Any:
+                timeout: float | None = None, *, host_pause: float = 0.0) -> Any:
         proc = self._proc
         request_id = uuid.uuid4().hex
         waiter: queue.Queue = queue.Queue(maxsize=1)
@@ -655,7 +668,7 @@ class _ServeSession:
             with self._waiters_lock:
                 self._waiters.pop(request_id, None)
             raise
-        end = min(time.monotonic() + (timeout or 60.0), self._deadline)
+        end = min(time.monotonic() + (timeout or 60.0), self._deadline + max(host_pause, 0.0))
         while time.monotonic() < end:
             if proc.poll() is not None:
                 break
@@ -693,7 +706,7 @@ def _initialize_params() -> dict[str, Any]:
     """MSP handshake: identity plus the sessionMcp capability that admits
     `config.mcpServers` on session/start (stable surface)."""
     return {"clientInfo": {
-        "name": "hermes_muse_code_exec", "version": "0.5.3"},
+        "name": "hermes_muse_code_exec", "version": "0.5.4"},
         "capabilities": {"requestedCapabilities": ["sessionMcp"]}}
 
 
@@ -779,6 +792,20 @@ def _msp_turn(prompt_text: str, *, model_id: str, cwd: str,
             "displayText": prompt_text[:200],
             "input": [{"type": "text", "text": prompt_text}]})
         turn_id = str((accepted or {}).get("turnId") or "")
+        if host_mcp:
+            def steer(request):
+                packet = {**request, "sessionId": session_id, "expectedTurnId": turn_id}
+                # Keep the exact admitted/uncertain wire identity on the pending
+                # request. A lost ack never permits a new command or turn.
+                request.update(packet)
+                ack = session.request("turn/steer", packet, timeout=10.0,
+                                      host_pause=host_mcp.paused_seconds())
+                if (not isinstance(ack, dict) or ack.get("commandId") != packet["commandId"]
+                        or ack.get("turnId") != turn_id or ack.get("status") != "accepted"):
+                    raise MuseTurnError("Native steer acknowledgement identity was not accepted.")
+                return ack
+            host_mcp.steer = steer
+            host_mcp.steer_ready.set()
         deltas: dict[str, list[str]] = {}
         final_text: str | None = None
         activity: list[str] = [f"policy: approval={effective or 'host-default'} "
@@ -1026,7 +1053,8 @@ if _HERMES_AVAILABLE:
             if native_tools or self._pending_native:
                 with self._native_lock:
                     text, activity = self._native_turn(prompt_text, messages or [],
-                        model_id=model_id, timeout_seconds=budget, tools=native_tools)
+                        model_id=model_id, timeout_seconds=budget, tools=native_tools,
+                        system_text=system_text)
             else:
                 text, activity = self._run_turn(
                     prompt_text, model_id=model_id,
@@ -1038,7 +1066,8 @@ if _HERMES_AVAILABLE:
                                                      tool_choice=tool_choice)
             return _completion_to_stream_chunks(completion) if stream else completion
 
-        def _native_turn(self, prompt, messages, *, model_id, timeout_seconds, tools):
+        def _native_turn(self, prompt, messages, *, model_id, timeout_seconds, tools,
+                         system_text=""):
             from gateway.session_context import get_session_env
             scope = (str(_harness_home().resolve()), self._cwd, _native_scope_cwd(),
                      *(get_session_env(name, '') for name in (
@@ -1053,16 +1082,49 @@ if _HERMES_AVAILABLE:
                 if result is None or pending['model'] != model_id:
                     self.cancel()
                     raise MuseTurnError('Pending native tool call has no matching host result; no replay submitted.')
+                count = pending['context_count']
+                if _native_context_digest(messages[:count], system_text) != pending['context_digest']:
+                    raise MusePolicyError('Native pending prefix/system context changed; no result released or turn replayed.')
+                result_index = next(i for i in range(len(messages) - 1, -1, -1)
+                    if messages[i] is result)
+                if any(m.get('role') not in ('assistant', 'tool') for m in messages[count:result_index]):
+                    raise MusePolicyError('Native context before the matching result is unsupported; original turn retained.')
+                updates = messages[result_index + 1:]
+                if any(m.get('role') != 'user' or not isinstance(m.get('content'), str)
+                       or not m['content'].strip() for m in updates):
+                    raise MusePolicyError('Only new text user rows support native steering; original turn retained.')
+                update = pending.get('context_update')
+                if update and update.get('attempted'):
+                    raise MuseTurnError('Native steer outcome is uncertain; original command/payload retained, not replayed.')
+                if updates:
+                    parts = [{'type': 'text', 'text': row['content']} for row in updates]
+                    if update and update['packet']['input'] != parts:
+                        raise MusePolicyError('Native steer payload changed; original command retained.')
+                    update = update or {'packet': {'commandId': uuid7(), 'input': parts}}
+                    pending['context_update'] = update
+                    if (not pending['mcp'].steer_ready.wait(timeout=min(timeout_seconds, 10.0))
+                            or not callable(pending['mcp'].steer)):
+                        raise MuseTurnError('Native steering channel unavailable; original result not released.')
+                    update['attempted'] = True
+                    try:
+                        pending['mcp'].steer(update['packet'])
+                    except Exception as exc:
+                        raise MuseTurnError('Native steer outcome is uncertain; original command/payload retained, not replayed.') from exc
+                    pending['context_update'] = None
                 pending['mcp'].tools = {t['function']['name']: t['function'] for t in tools}
                 content = result.get('content')
                 pending['mcp'].results.put({'id': pending['call_id'],
                     'content': content if isinstance(content, str) else json.dumps(content)})
                 pending['call_id'] = None
+                pending['context_count'] = len(messages)
+                pending['context_digest'] = _native_context_digest(messages, system_text)
             else:
                 if self._cancel_requested.is_set():
                     raise MuseTurnError('Muse request cancelled; not submitted.')
                 endpoint = _HostToolMCP(tools)
-                pending = {'mcp': endpoint, 'call_id': None, 'model': model_id, 'scope': scope}
+                pending = {'mcp': endpoint, 'call_id': None, 'model': model_id, 'scope': scope,
+                           'context_count': len(messages),
+                           'context_digest': _native_context_digest(messages, system_text)}
                 self._pending_native = pending
                 def runner():
                     try:
