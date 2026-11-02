@@ -11,7 +11,7 @@ its model backend — the same external-process pattern as the bundled
 ## Requirements
 
 - Hermes Agent >= 0.21.3
-- `muse` on PATH (or `HERMES_MUSE_CODE_EXEC_COMMAND` / `MUSE_CLI_PATH`)
+- `muse` on PATH (or `HERMES_MUSE_CODE_EXEC_COMMAND` | `muse` binary override (or `MUSE_CLI_PATH`) | `muse` on PATH |
 - A working Muse Code login (`muse usage` succeeds)
 
 ## Usage
@@ -57,7 +57,7 @@ answer an interactive prompt. Sandbox stays ON; only an explicit
 `--disable-sandbox`. Explicit overrides:
 `HERMES_MUSE_CODE_EXEC_APPROVAL_MODE` (MSP session mode),
 `HERMES_MUSE_CODE_EXEC_EXEC_APPROVAL` (exec flag),
-`HERMES_MUSE_CODE_EXEC_COMMAND` / `MUSE_CLI_PATH` (binary).
+`HERMES_MUSE_CODE_EXEC_COMMAND` | `muse` binary override (or `MUSE_CLI_PATH`) | `muse` on PATH |
 
 Policy reliability (v0.3.1): streaming preserves the caller's context-local
 Hermes profile. The host must confirm a requested approval mode before the
@@ -67,12 +67,20 @@ MSP and exec. Traces record the host-confirmed approval mode, sandbox launch
 setting, tool name/status and failure class, without raw tool arguments or
 failure text. Past transcript denials do not establish the new turn's access.
 
+Native Hermes tools (v0.4.0): each MSP turn attaches
+`hermes mcp-serve --tools` as a session MCP server (stable `sessionMcp`
+capability + `config.mcpServers`), so the model natively calls Hermes
+tools — `messages_send`, `channels_list`, `skills_list`, `skill_view`,
+web/vision tools — alongside its own host shell and files. Requires the
+official `mcp-serve` plugin installed in every profile that runs this
+provider. `HERMES_MUSE_CODE_EXEC_NO_MCP=1` opts a profile out (turns run
+tool-less, as in v0.3.x). The exec fallback stays tool-less.
+
 ## v1 limits
 
-- No Hermes-side tool loop: Hermes tool schemas are ignored (logged) and the
-  completion ends `stop` with final text. Each turn has a new Muse session;
-  Hermes supplies the conversation history.
-- One subprocess per completion (same cost profile as `copilot-acp`).
+- Each turn has a new Muse session; Hermes supplies the conversation history.
+- One subprocess per completion (same cost profile as `copilot-acp`), plus
+  one `hermes mcp-serve` child while MCP tools are attached.
 - No vision payloads in v1.
 
 ## Configuration
@@ -80,6 +88,7 @@ failure text. Past transcript denials do not establish the new turn's access.
 | Variable | Purpose | Default |
 |---|---|---|
 | `HERMES_MUSE_CODE_EXEC_COMMAND` | `muse` binary override (or `MUSE_CLI_PATH`) | `muse` on PATH |
+| `HERMES_MUSE_CODE_EXEC_NO_MCP` | `1` disables the Hermes MCP tool bridge | bridge on |
 
 ## Troubleshooting
 

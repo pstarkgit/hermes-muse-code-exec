@@ -7,7 +7,10 @@ provider. Meta accepts the subscription key only from the Muse Code client
 
 Transport: MSP over `muse serve` stdio first (live streaming, one process
 per turn, harness-selected approval mode, request_user_input withheld).
-Only transport failures before turn submission may fall back to exec.
+Each turn attaches `hermes mcp-serve --tools` as a session MCP server so
+the model calls native Hermes tools (messaging, skills, web) alongside
+its own host tools. Only transport failures before turn submission may
+fall back to exec (tool-less).
 """
 
 import contextlib
@@ -34,6 +37,7 @@ ENV_COMMAND_VARS = ("HERMES_MUSE_CODE_EXEC_COMMAND", "MUSE_CLI_PATH")
 ENV_APPROVAL_MODE = "HERMES_MUSE_CODE_EXEC_APPROVAL_MODE"
 ENV_NO_SANDBOX = "HERMES_MUSE_CODE_EXEC_NO_SANDBOX"
 ENV_EXEC_APPROVAL = "HERMES_MUSE_CODE_EXEC_EXEC_APPROVAL"
+ENV_NO_MCP = "HERMES_MUSE_CODE_EXEC_NO_MCP"
 PROFILE_NAME = "muse-code-exec"
 EXEC_MARKER_BASE_URL = "exec://muse-code"
 
@@ -75,6 +79,34 @@ def resolve_command() -> str:
         if override:
             return override
     return shutil.which("muse") or "muse"
+
+
+def _mcp_enabled() -> bool:
+    """Hermes MCP bridge on/off. On unless the harness explicitly opts out
+    via HERMES_MUSE_CODE_EXEC_NO_MCP=1."""
+    return os.getenv(ENV_NO_MCP, "").strip() not in ("1", "true", "yes")
+
+
+def _msp_mcp_servers() -> dict[str, Any]:
+    """Native Hermes tools for this MSP turn, served over MCP.
+
+    Attaches `hermes mcp-serve --tools` (conversation bridge + skills +
+    web/vision tools) as a session MCP server so the model calls real
+    Hermes tools — messages_send, channels_list, skills_list, skill_view
+    and the rest — instead of working tool-less. The server runs with the
+    ambient profile home, so the turn sees the calling profile's
+    conversations and skills. Requires the mcp-serve plugin installed in
+    that profile. Failures refuse loudly (mode required) so a turn never
+    silently runs without the bridge; only transport failures before turn
+    submission may fall back to exec, which stays tool-less.
+    """
+    if not _mcp_enabled():
+        return {}
+    return {"hermes": {
+        "transport": "stdio",
+        "command": shutil.which("hermes") or "hermes",
+        "args": ["mcp-serve", "--tools"],
+        "mode": "required"}}
 
 
 def _harness_home() -> Path:
@@ -165,8 +197,12 @@ TURN_PREAMBLE = (
     "never appear as your identity. Keep any statement about your own "
     "nature to one short sentence and never lecture the user about "
     "runtimes, models, or providers. "
-    "Transport facts: this turn has no Hermes-side tools, so use your own "
-    "tools only. Each completion starts a fresh process with "
+    "Transport facts: Hermes tools are attached over MCP (names starting "
+    "with 'mcp__hermes__': messages_send, channels_list, skills_list, "
+    "skill_view, web tools and the rest) — prefer them for messaging, "
+    "skills and Hermes-native actions; your own host tools cover shell "
+    "and files. If an MCP Hermes tool is missing, say which one. "
+    "Each completion starts a fresh process with "
     "harness-selected policy. Previous permission failures do not prove "
     "that tools are blocked now: before reporting a current tool block, "
     "attempt the required tool in this turn and report its actual error. "
@@ -411,6 +447,28 @@ class _ServeSession:
         self._on_release()
 
 
+def _initialize_params() -> dict[str, Any]:
+    """MSP handshake: identity plus the sessionMcp capability that admits
+    `config.mcpServers` on session/start (stable surface)."""
+    return {"clientInfo": {
+        "name": "hermes_muse_code_exec", "version": "0.4.0"},
+        "capabilities": {"requestedCapabilities": ["sessionMcp"]}}
+
+
+def _session_start_params(*, model_id: str, cwd: str) -> dict[str, Any]:
+    """session/start params: identity, workspace, harness approval mode and
+    the Hermes MCP bridge (omitted only when explicitly disabled)."""
+    params: dict[str, Any] = {"commandId": uuid7(), "modelId": model_id,
+                              "workspaceRoot": cwd}
+    mcp_servers = _msp_mcp_servers()
+    if mcp_servers:
+        params["config"] = {"mcpServers": mcp_servers}
+    harnessed = _msp_approval_mode()
+    if harnessed:
+        params["approvalMode"] = harnessed
+    return params
+
+
 def _msp_turn(prompt_text: str, *, model_id: str, cwd: str,
               timeout_seconds: float,
               on_delta: Callable[[str], None] | None,
@@ -437,17 +495,12 @@ def _msp_turn(prompt_text: str, *, model_id: str, cwd: str,
     session = _ServeSession(proc, deadline, on_release=lambda: None)
     turn_requested = False
     try:
-        session.request("initialize", {"clientInfo": {
-            "name": "hermes_muse_code_exec", "version": "0.3.1"}},
-            timeout=30.0)
+        session.request("initialize", _initialize_params(), timeout=30.0)
         proc.stdin.write(json.dumps(
             {"jsonrpc": "2.0", "method": "initialized"}) + "\n")
         proc.stdin.flush()
-        params: dict[str, Any] = {"commandId": uuid7(), "modelId": model_id,
-                                  "workspaceRoot": cwd}
-        harnessed = _msp_approval_mode()
-        if harnessed:
-            params["approvalMode"] = harnessed
+        params = _session_start_params(model_id=model_id, cwd=cwd)
+        harnessed = params.get("approvalMode")
         try:
             started = session.request("session/start", params)
         except RuntimeError as exc:
@@ -646,8 +699,9 @@ if _HERMES_AVAILABLE:
                          system: Any = None, instructions: Any = None,
                          **_: Any) -> Any:
             if tools:
-                logger.debug("muse-code-exec ignores %d Hermes tool "
-                             "schema(s): the turn uses its own tools.",
+                logger.debug("muse-code-exec carries %d Hermes tool "
+                             "schema(s) via the session MCP bridge instead "
+                             "of the chat payload.",
                              len(tools))
             prompt_text = _render_messages(list(messages or []))
             if not prompt_text.strip():

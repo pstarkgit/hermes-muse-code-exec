@@ -501,3 +501,61 @@ def test_trace_distinguishes_confirmed_policy_from_an_actual_tool_denial():
     assert "approval=allowAll" in trace
     assert "tool=shell" in trace and "approval_denied" in trace and "deny_unmatched" in trace
     assert "private-content" not in trace
+
+
+def test_mcp_bridge_attached_by_default():
+    module, _ = _load_plugin()
+    servers = module._msp_mcp_servers()
+    assert set(servers) == {"hermes"}
+    entry = servers["hermes"]
+    assert entry["transport"] == "stdio"
+    assert entry["args"] == ["mcp-serve", "--tools"]
+    assert entry["mode"] == "required"
+    assert entry["command"].endswith("hermes")
+
+
+def test_mcp_bridge_disabled_by_env():
+    import os
+    module, _ = _load_plugin()
+    with patch.dict(os.environ, {"HERMES_MUSE_CODE_EXEC_NO_MCP": "1"}):
+        assert module._msp_mcp_servers() == {}
+        params = module._session_start_params(model_id="m", cwd="/tmp")
+        assert "config" not in params
+
+
+def test_initialize_requests_session_mcp_capability():
+    module, _ = _load_plugin()
+    params = module._initialize_params()
+    assert "sessionMcp" in params["capabilities"]["requestedCapabilities"]
+
+
+def test_session_start_carries_mcp_bridge():
+    module, _ = _load_plugin()
+    params = module._session_start_params(model_id="muse-spark-1.3", cwd="/tmp")
+    bridge = params["config"]["mcpServers"]["hermes"]
+    assert bridge["transport"] == "stdio"
+    assert bridge["args"] == ["mcp-serve", "--tools"]
+    assert bridge["mode"] == "required"
+
+
+def test_msp_handshake_sends_capability_and_bridge():
+    module, _ = _load_plugin()
+    host, requests = _fake_msp(module)
+    with host:
+        module._msp_turn("probe", model_id="test", cwd=str(REPO),
+                         timeout_seconds=5, on_delta=None,
+                         track=lambda *args: None)
+    by_method = {method: params for method, params in requests}
+    assert "sessionMcp" in by_method["initialize"]["capabilities"][
+        "requestedCapabilities"]
+    assert by_method["session/start"]["config"]["mcpServers"]["hermes"][
+        "args"] == ["mcp-serve", "--tools"]
+
+
+def test_preamble_names_mcp_hermes_tools():
+    module, _ = _load_plugin()
+    lowered = module.TURN_PREAMBLE.lower()
+    assert "mcp__hermes__" in lowered
+    assert "no hermes-side tools" not in lowered
+    assert "messages_send" in lowered
+    assert "skills_list" in lowered
