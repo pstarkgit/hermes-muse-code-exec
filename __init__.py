@@ -7,16 +7,18 @@ provider. Meta accepts the subscription key only from the Muse Code client
 
 Transport: MSP over `muse serve` stdio first (live streaming, one process
 per turn, harness-selected approval mode, request_user_input withheld).
-Each turn attaches `hermes mcp-serve --tools` as a session MCP server so
-the model calls native Hermes tools (messaging, skills, web) alongside
-its own host tools. Only transport failures before turn submission may
-fall back to exec (tool-less).
+Hermes supplies its exact authorized tools through the maintained host-tool
+bridge; structured calls execute in the real parent AIAgent, not in this
+subprocess. When no host tool surface is supplied, the curated session MCP
+bridge remains available. Only pre-submission transport failures may fall
+back to exec; the same host-tool contract survives that fallback.
 """
 
 import contextlib
 import contextvars
 import json
 import logging
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 import queue
 import random
@@ -44,10 +46,23 @@ EXEC_MARKER_BASE_URL = "exec://muse-code"
 
 class MusePolicyError(RuntimeError):
     """The host could not establish the harness-selected approval policy."""
+    muse_no_automatic_replay = True
 
 
 class MuseTurnError(RuntimeError):
     """A turn may have executed tools and must not be automatically replayed."""
+    muse_no_automatic_replay = True
+
+
+def _classify_muse_error(error, **_):
+    # A plain RuntimeError is retryable in Hermes by default. Carry the
+    # no-replay decision through the REAL parent retry/fallback boundary too.
+    if getattr(error, "muse_no_automatic_replay", False) is True:
+        return {"reason": "format_error", "retryable": False,
+                "should_fallback": False, "should_rotate_credential": False,
+                "should_compress": False,
+                "error_context": {"muse_no_automatic_replay": True}}
+    return None
 
 # Standards first, then contributor tiers. Contributor bills to the sub too
 # (the attested CLI is allowed to use it), but it permits training on your
@@ -119,6 +134,192 @@ def _harness_home() -> Path:
         if override:
             return Path(override)
         return Path(os.path.expanduser("~")) / ".hermes"
+
+
+def _build_subprocess_env() -> dict[str, str]:
+    """Pin the real calling profile and session; never inherit a sibling's env."""
+    from tools.environments.local import served_profile_child_env
+    return served_profile_child_env(
+        target_home=_harness_home(), inherit_credentials=False)
+
+
+def _host_tools(tools: list[dict] | None) -> list[dict]:
+    """Carry the caller's exact tool surface, including injected/plugin tools.
+
+    The host dispatches these calls in its actual agent context. No new tool is
+    granted by the provider. Hermes, not a second adapter allowlist, owns role
+    visibility and dispatch. The Muse subprocess never executes these calls.
+    """
+    selected = []
+    for tool in tools or []:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            continue
+        selected.append(tool)
+    return selected
+
+
+class _HostToolMCP:
+    """Finite per-completion MCP admission endpoint; never executes a tool.
+
+    Native MCP calls become normal Hermes function calls. Their HTTP requests
+    stay pending while Hermes persists and executes them in the real agent.
+    The next completion returns the actual matching result to the same Muse
+    session, preserving native call state without a replay or fabricated result.
+    No agent reference, credential or board mutation is exposed to this server.
+    """
+
+    def __init__(self, tools):
+        self.tools = {t['function']['name']: t['function'] for t in tools}
+        self.calls = queue.Queue()
+        self.results = queue.Queue()
+        self.call_serial = threading.Lock()
+        self.requests = {}
+        self.closed = threading.Event()
+        self.lock = threading.Lock()
+        self.wait_started = None
+        self.wait_total = 0.0
+        self.path = '/mcp/' + uuid.uuid4().hex
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass  # Never log the ephemeral capability URL or tool payload.
+
+            def reply(self, status, body=None):
+                data = json.dumps(body).encode() if body is not None else b''
+                self.send_response(status)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                    self.wfile.write(data)
+
+            def authorized(self):
+                # Native local clients have no browser Origin. Reject browser
+                # and rebinding requests even if they discover the random path.
+                return self.path == owner.path and not self.headers.get('Origin')
+
+            def do_GET(self):
+                self.reply(405 if self.authorized() else 403)
+
+            def do_DELETE(self):
+                self.reply(405 if self.authorized() else 403)
+
+            def do_POST(self):
+                if not self.authorized():
+                    self.reply(403); return
+                try:
+                    size = int(self.headers.get('Content-Length', '0'))
+                    if not 0 < size <= 4 * 1024 * 1024:
+                        self.reply(413); return
+                    self.connection.settimeout(10)
+                    msg = json.loads(self.rfile.read(size))
+                    if not isinstance(msg, dict):
+                        self.reply(400); return
+                    method = msg.get('method')
+                    ident = msg.get('id')
+                    if ident is None:
+                        self.reply(202); return
+                    params = msg.get('params') or {}
+                    if method == 'initialize':
+                        result = {'protocolVersion': params.get('protocolVersion', '2025-03-26'),
+                                  'capabilities': {'tools': {}},
+                                  'serverInfo': {'name': 'hermes-host', 'version': '0.5.1'}}
+                    elif method == 'ping':
+                        result = {}
+                    elif method == 'tools/list':
+                        result = {'tools': [{'name': name,
+                            'description': fn.get('description', name),
+                            'inputSchema': fn.get('parameters') or {'type': 'object', 'properties': {}}}
+                            for name, fn in owner.tools.items()]}
+                    elif method == 'tools/call':
+                        name = params.get('name'); arguments = params.get('arguments', {})
+                        if name not in owner.tools or not isinstance(arguments, dict):
+                            self.reply(200, _jsonrpc_error(ident, -32602, 'Tool outside current Hermes surface or invalid arguments'))
+                            return
+                        if not isinstance(ident, (str, int)) or isinstance(ident, bool):
+                            self.reply(400); return
+                        request_key = json.dumps(ident)
+                        immutable = json.dumps(params, sort_keys=True, separators=(',', ':'))
+                        with owner.lock:
+                            record = owner.requests.get(request_key)
+                            first = record is None
+                            if first:
+                                record = {'immutable': immutable, 'ready': threading.Event(), 'response': None}
+                                owner.requests[request_key] = record
+                        if record['immutable'] != immutable:
+                            self.reply(200, _jsonrpc_error(ident, -32602, 'MCP request identity reused with changed payload')); return
+                        if not first:
+                            while not record['ready'].wait(0.1) and not owner.closed.is_set():
+                                pass
+                            self.reply(200, record['response'] or _jsonrpc_error(ident, -32800, 'Hermes turn closed'))
+                            return
+
+                        def settle(response):
+                            record['response'] = response
+                            record['ready'].set()
+                            self.reply(200, response)
+
+                        with owner.call_serial:
+                            if name not in owner.tools or not isinstance(arguments, dict):
+                                settle(_jsonrpc_error(ident, -32602, 'Tool no longer offered by Hermes')); return
+                            if owner.closed.is_set():
+                                settle(_jsonrpc_error(ident, -32800, 'Hermes turn closed')); return
+                            call = {'id': 'call_' + uuid.uuid4().hex, 'type': 'function',
+                                    'function': {'name': name, 'arguments': json.dumps(arguments)}}
+                            owner.wait_started = time.monotonic()
+                            owner.calls.put(('call', call))
+                            while not owner.closed.is_set():
+                                try:
+                                    returned = owner.results.get(timeout=0.1)
+                                except queue.Empty:
+                                    continue
+                                if returned['id'] != call['id']:
+                                    settle(_jsonrpc_error(ident, -32603, 'Host result identity mismatch')); return
+                                owner.wait_total += time.monotonic() - owner.wait_started
+                                owner.wait_started = None
+                                settle({'jsonrpc': '2.0', 'id': ident, 'result': {
+                                    'content': [{'type': 'text', 'text': returned['content']}]}})
+                                return
+                        settle(_jsonrpc_error(ident, -32800, 'Hermes turn closed'))
+                        return
+                    else:
+                        self.reply(200, _jsonrpc_error(ident, -32601, 'Method unavailable')); return
+                    self.reply(200, {'jsonrpc': '2.0', 'id': ident, 'result': result})
+                except (ValueError, OSError, TypeError):
+                    self.reply(400)
+
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       kwargs={'poll_interval': 0.05}, daemon=True)
+        self.thread.start()
+
+    def paused_seconds(self):
+        started = self.wait_started
+        return self.wait_total + (time.monotonic() - started if started is not None else 0.0)
+
+    def config(self):
+        return {'hermes_host': {'transport': 'streamableHttp',
+                'url': f'http://127.0.0.1:{self.server.server_port}{self.path}', 'mode': 'required'}}
+
+    def take(self):
+        try:
+            kind, call = self.calls.get_nowait()
+        except queue.Empty:
+            return None
+        return '<tool_call>' + json.dumps(call) + '</tool_call>'
+
+    def close(self):
+        with self.lock:
+            if self.closed.is_set():
+                return
+            self.closed.set()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=1)
 
 
 def _read_harness_approvals_mode() -> str | None:
@@ -197,11 +398,17 @@ TURN_PREAMBLE = (
     "never appear as your identity. Keep any statement about your own "
     "nature to one short sentence and never lecture the user about "
     "runtimes, models, or providers. "
-    "Transport facts: Hermes tools are attached over MCP (names starting "
-    "with 'mcp__hermes__': messages_send, channels_list, skills_list, "
-    "skill_view, web tools and the rest) — prefer them for messaging, "
-    "skills and Hermes-native actions; your own host tools cover shell "
-    "and files. If an MCP Hermes tool is missing, say which one. "
+    "Transport facts: when Hermes function schemas are listed below, use "
+    "their <tool_call> contract for Hermes actions. Those calls run in the "
+    "actual calling agent, including its message_agent Bot Chat route, "
+    "configured a2a_* protocol tools, session/delegation tools, memory, "
+    "plugins and skills. Do not substitute a platform message for an "
+    "internal bot handoff. A queued acknowledgement is not completion; "
+    "preserve its delivery/task/run identity and follow the tool's return "
+    "contract without resending. With no supplied host tool surface a "
+    "curated mcp__hermes__ bridge (messages_send, skills_list and other "
+    "configured tools) may be attached instead. Use only tools "
+    "actually available in this turn. "
     "Each completion starts a fresh process with "
     "harness-selected policy. Previous permission failures do not prove "
     "that tools are blocked now: before reporting a current tool block, "
@@ -240,16 +447,23 @@ def _render_messages(messages: list[dict]) -> str:
             text = "\n".join(t for t in texts if t)
         else:
             text = str(content or "")
-        if not text.strip():
-            continue
         label = {"system": "System", "user": "User", "assistant": "Assistant",
                  "tool": "Tool result"}.get(role, "User")
-        parts.append(f"{label}:\n{text}")
+        if role == "tool":
+            label += f" [{msg.get('tool_call_id') or ''}] {msg.get('name') or ''}"
+        if text.strip():
+            parts.append(f"{label}:\n{text}")
+        for call in msg.get("tool_calls") or []:
+            get = call.get if isinstance(call, dict) else lambda key, default=None: getattr(call, key, default)
+            fn = get("function")
+            fn_get = fn.get if isinstance(fn, dict) else lambda key, default=None: getattr(fn, key, default)
+            parts.append(f"Assistant tool call [{get('id') or ''}]: "
+                         f"{fn_get('name') or ''}({fn_get('arguments') or '{}'})")
     return "\n\n".join(parts)
 
 
 def run_exec_completion(prompt_text: str, *, model: str | None, cwd: str,
-                        timeout_seconds: float) -> str:
+                        timeout_seconds: float, track=None) -> str:
     """Fallback: one `muse exec --json` turn; return its final text."""
     args = ([resolve_command(), "exec", "--json",
              "--disable-request-user-input"] + _exec_approval_flag() +
@@ -264,10 +478,20 @@ def run_exec_completion(prompt_text: str, *, model: str | None, cwd: str,
         prompt_path = fh.name
     args += ["--prompt-file", prompt_path]
     try:
-        proc = subprocess.run(
-            args, capture_output=True, text=True,
-            timeout=max(float(timeout_seconds), 1.0),
-            env=os.environ.copy(), cwd=cwd)
+        if track is None:
+            proc = subprocess.run(
+                args, capture_output=True, text=True,
+                timeout=max(float(timeout_seconds), 1.0),
+                env=_build_subprocess_env(), cwd=cwd)
+        else:
+            child = subprocess.Popen(args, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, env=_build_subprocess_env(), cwd=cwd)
+            try:
+                track(child)
+                stdout, stderr = child.communicate(timeout=max(float(timeout_seconds), 1.0))
+                proc = SimpleNamespace(returncode=child.returncode, stdout=stdout, stderr=stderr)
+            finally:
+                track(None, child)
     finally:
         try:
             os.unlink(prompt_path)
@@ -357,7 +581,8 @@ class _ServeSession:
         self.stderr_tail: deque[str] = deque(maxlen=40)
         self._waiters: dict[str, queue.Queue] = {}
         self._waiters_lock = threading.Lock()
-        threading.Thread(target=self._pump, args=(proc.stdout, self.inbox.put),
+        threading.Thread(target=self._pump, args=(proc.stdout, self.inbox.put,
+                         lambda: self.inbox.put(None)),
                          daemon=True).start()
         self._stderr_pump = threading.Thread(
             target=self._pump,
@@ -365,12 +590,17 @@ class _ServeSession:
                 line.rstrip("\n"))),
             daemon=True)
         self._stderr_pump.start()
-        threading.Thread(target=self._dispatch, daemon=True).start()
+        self._dispatch_thread = threading.Thread(target=self._dispatch, daemon=True)
+        self._dispatch_thread.start()
 
     @staticmethod
-    def _pump(stream, sink) -> None:
-        for line in stream or ():
-            sink(line)
+    def _pump(stream, sink, on_end=None) -> None:
+        try:
+            for line in stream or ():
+                sink(line)
+        finally:
+            if on_end:
+                on_end()
 
     def _dispatch(self) -> None:
         """Continuously route raw lines: responses to their waiter,
@@ -379,6 +609,9 @@ class _ServeSession:
         while True:
             line = self.inbox.get()
             if line is None:
+                # Wake an active turn immediately on exit/cancellation. Ending
+                # only this dispatcher leaves poll_note asleep until its budget.
+                self.notes.put({"method": "_transport/closed", "params": {}})
                 return
             try:
                 msg = json.loads(line)
@@ -451,16 +684,17 @@ def _initialize_params() -> dict[str, Any]:
     """MSP handshake: identity plus the sessionMcp capability that admits
     `config.mcpServers` on session/start (stable surface)."""
     return {"clientInfo": {
-        "name": "hermes_muse_code_exec", "version": "0.4.0"},
+        "name": "hermes_muse_code_exec", "version": "0.5.1"},
         "capabilities": {"requestedCapabilities": ["sessionMcp"]}}
 
 
-def _session_start_params(*, model_id: str, cwd: str) -> dict[str, Any]:
+def _session_start_params(*, model_id: str, cwd: str,
+                          attach_mcp: bool = True) -> dict[str, Any]:
     """session/start params: identity, workspace, harness approval mode and
     the Hermes MCP bridge (omitted only when explicitly disabled)."""
     params: dict[str, Any] = {"commandId": uuid7(), "modelId": model_id,
                               "workspaceRoot": cwd}
-    mcp_servers = _msp_mcp_servers()
+    mcp_servers = _msp_mcp_servers() if attach_mcp else {}
     if mcp_servers:
         params["config"] = {"mcpServers": mcp_servers}
     harnessed = _msp_approval_mode()
@@ -472,7 +706,8 @@ def _session_start_params(*, model_id: str, cwd: str) -> dict[str, Any]:
 def _msp_turn(prompt_text: str, *, model_id: str, cwd: str,
               timeout_seconds: float,
               on_delta: Callable[[str], None] | None,
-              track: Callable[[subprocess.Popen[str]], None]) -> tuple[str,
+              track: Callable[[subprocess.Popen[str]], None],
+              attach_mcp: bool = True, host_tools=None, host_mcp=None) -> tuple[str,
                                                                       list[str]]:
     """One MSP turn on a fresh `muse serve` process. Raises on any failure
     so the caller can fall back to `muse exec`."""
@@ -482,15 +717,24 @@ def _msp_turn(prompt_text: str, *, model_id: str, cwd: str,
              "--no-session-log"] + _serve_extra_flags(),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8",
-            errors="replace", bufsize=1, cwd=cwd, env=os.environ.copy())
-    except FileNotFoundError as exc:
+            errors="replace", bufsize=1, cwd=cwd, env=_build_subprocess_env())
+    except Exception as exc:
+        if host_mcp:
+            host_mcp.close()
         raise RuntimeError(
             "Could not start Muse serve command. Install Muse Code or set "
             "HERMES_MUSE_CODE_EXEC_COMMAND/MUSE_CLI_PATH.") from exc
     if proc.stdin is None or proc.stdout is None:
         proc.kill()
+        if host_mcp:
+            host_mcp.close()
         raise RuntimeError("Muse serve process did not expose stdio pipes.")
-    track(proc)
+    try:
+        track(proc)
+    except Exception:
+        if host_mcp:
+            host_mcp.close()
+        raise
     deadline = time.monotonic() + max(float(timeout_seconds), 1.0)
     session = _ServeSession(proc, deadline, on_release=lambda: None)
     turn_requested = False
@@ -499,7 +743,10 @@ def _msp_turn(prompt_text: str, *, model_id: str, cwd: str,
         proc.stdin.write(json.dumps(
             {"jsonrpc": "2.0", "method": "initialized"}) + "\n")
         proc.stdin.flush()
-        params = _session_start_params(model_id=model_id, cwd=cwd)
+        params = _session_start_params(model_id=model_id, cwd=cwd,
+                                       attach_mcp=attach_mcp)
+        if host_mcp:
+            params["config"] = {"mcpServers": host_mcp.config()}
         harnessed = params.get("approvalMode")
         try:
             started = session.request("session/start", params)
@@ -528,12 +775,14 @@ def _msp_turn(prompt_text: str, *, model_id: str, cwd: str,
         activity: list[str] = [f"policy: approval={effective or 'host-default'} "
                                f"sandbox={'disabled' if _serve_extra_flags() else 'enabled'}"]
         ok = False
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline + (host_mcp.paused_seconds() if host_mcp else 0):
             note = session.poll_note(
-                timeout=min(deadline - time.monotonic(), 30.0))
+                timeout=min(deadline + (host_mcp.paused_seconds() if host_mcp else 0) - time.monotonic(), 0.1 if host_mcp else 30.0))
             if note is None:
                 continue
             method = note.get("method")
+            if method == "_transport/closed":
+                raise RuntimeError("Muse serve transport closed before turn completion.")
             p = note.get("params") or {}
             if p.get("sessionId") != session_id:
                 continue
@@ -607,12 +856,18 @@ def _msp_turn(prompt_text: str, *, model_id: str, cwd: str,
                 f"Muse turn failed after submission; automatic replay was stopped: {exc}") from exc
         raise
     finally:
-        track(None, proc)
+        try:
+            track(None, proc)
+        finally:
+            if host_mcp:
+                host_mcp.close()
 
 
 if _HERMES_AVAILABLE:
     from agent.acp_openai_bridge import (
         completion_to_stream_chunks as _completion_to_stream_chunks,
+        extract_tool_calls_from_text as _extract_tool_calls_from_text,
+        render_tool_bridge_sections as _render_tool_bridge_sections,
     )
 
     class MuseCodeExecProfile(ProviderProfile):
@@ -620,6 +875,11 @@ if _HERMES_AVAILABLE:
 
         HERMES_SKIP_TRANSPORT_WRAP = True
         HERMES_SKIP_ASYNC_WRAP = True
+
+        def build_api_kwargs_extras(self, *, reasoning_config=None, **context):
+            # Native transport omits `tools` when its authorized surface is
+            # empty. Preserve that fact rather than attaching standalone MCP.
+            return {}, {"_hermes_host_tool_surface": True}
 
         def create_client(self, **client_kwargs: Any) -> Any:
             return MuseCodeExecClient(**client_kwargs)
@@ -644,6 +904,8 @@ if _HERMES_AVAILABLE:
         HERMES_SKIP_TRANSPORT_WRAP = True
         HERMES_SKIP_ASYNC_WRAP = True
 
+        SUPPORTS_HERMES_TOOL_CALLS = True
+
         def __init__(self, *, api_key: str | None = None,
                      base_url: str | None = None,
                      default_headers: dict[str, str] | None = None,
@@ -657,6 +919,9 @@ if _HERMES_AVAILABLE:
             self.is_closed = False
             self._active_processes: set[subprocess.Popen[str]] = set()
             self._active_process_lock = threading.Lock()
+            self._cancel_requested = threading.Event()
+            self._pending_native = None
+            self._native_lock = threading.Lock()
 
         @staticmethod
         def _terminate_process(proc: subprocess.Popen[str]) -> None:
@@ -669,24 +934,38 @@ if _HERMES_AVAILABLE:
 
         def _track(self, proc: subprocess.Popen[str] | None,
                    old: subprocess.Popen[str] | None = None) -> None:
+            rejected = False
             with self._active_process_lock:
                 if old is not None:
                     self._active_processes.discard(old)
                 if proc is not None:
-                    self._active_processes.add(proc)
-                    self.is_closed = False
+                    rejected = self._cancel_requested.is_set()
+                    if not rejected:
+                        self._active_processes.add(proc)
+                        self.is_closed = False
                 if not self._active_processes:
                     self.is_closed = True
             if old is not None:
                 self._terminate_process(old)
+            if rejected:
+                self._terminate_process(proc)
+                raise MuseTurnError("Muse request was cancelled; no replacement process may run.")
 
         def close(self) -> None:
+            self._cancel_requested.set()
             with self._active_process_lock:
                 procs, self._active_processes = tuple(
                     self._active_processes), set()
             self.is_closed = True
             for proc in procs:
                 self._terminate_process(proc)
+            pending = self._pending_native
+            if pending:
+                pending['mcp'].close()
+
+        def cancel(self) -> None:
+            """Hermes' native cross-thread abort hook for non-HTTP providers."""
+            self.close()
 
         def list_models(self, *, timeout_seconds: float = 15.0) -> list[str]:
             return list(CURATED_MODELS)
@@ -697,12 +976,12 @@ if _HERMES_AVAILABLE:
                          tools: list[dict] | None = None,
                          tool_choice: Any = None, stream: bool = False,
                          system: Any = None, instructions: Any = None,
+                         _hermes_host_tool_surface: bool = False,
                          **_: Any) -> Any:
-            if tools:
-                logger.debug("muse-code-exec carries %d Hermes tool "
-                             "schema(s) via the session MCP bridge instead "
-                             "of the chat payload.",
-                             len(tools))
+            offered = _host_tools(tools)
+            # An explicitly supplied surface (including []) is authoritative.
+            # Do not replace it with the MCP server's broader CLI toolsets.
+            attach_mcp = tools is None and not _hermes_host_tool_surface
             prompt_text = _render_messages(list(messages or []))
             if not prompt_text.strip():
                 raise RuntimeError("muse-code-exec received an empty prompt.")
@@ -713,6 +992,11 @@ if _HERMES_AVAILABLE:
                                "outranks everything below):\n" + system_text +
                                "\n\n" + prompt_text)
             prompt_text = TURN_PREAMBLE + "\n\n" + prompt_text
+            sections = []  # Schemas travel once, through native MCP tools/list.
+            if offered:
+                prompt_text += "\n\nUse the hermes_host MCP tools for Hermes actions. They are natively registered for this session. Do not call muse.message_agent or substitute Muse shell for a Hermes tool. The Hermes host executes each call and returns its real result to this same Muse session. Available Hermes functions: " + ", ".join(t["function"]["name"] for t in offered) + ". Tool choice: " + json.dumps(tool_choice) + "\n"
+            if sections:
+                prompt_text += "\n\n" + "\n\n".join(sections)
             try:
                 budget = float(timeout) if timeout else 600.0
             except (TypeError, ValueError):
@@ -721,36 +1005,96 @@ if _HERMES_AVAILABLE:
             requested = str(model or "").strip() or None
             model_id = requested or CURATED_MODELS[0]
             label = str(model or PROFILE_NAME)
-            if stream:
+            if stream and not offered and not self._pending_native:
                 return self._stream_turn(
                     prompt_text, model_id=model_id, model_label=label,
-                    timeout_seconds=budget)
-            text, activity = self._run_turn(
-                prompt_text, model_id=model_id,
-                timeout_seconds=budget, on_delta=None)
-            message = SimpleNamespace(
-                content=text, tool_calls=[],
-                reasoning="\n".join(activity) or None,
-                reasoning_content="\n".join(activity) or None,
-                reasoning_details=None)
-            return SimpleNamespace(
-                choices=[SimpleNamespace(message=message,
-                                         finish_reason="stop")],
-                usage=SimpleNamespace(
-                    prompt_tokens=0, completion_tokens=0, total_tokens=0,
-                    prompt_tokens_details=SimpleNamespace(cached_tokens=0)),
-                model=label)
+                    timeout_seconds=budget, attach_mcp=attach_mcp)
+            native_tools = offered
+            if tool_choice == "none":
+                native_tools = []
+            elif isinstance(tool_choice, dict) and tool_choice.get("function", {}).get("name"):
+                native_tools = [t for t in offered if t["function"]["name"] == tool_choice["function"]["name"]]
+            if native_tools or self._pending_native:
+                with self._native_lock:
+                    text, activity = self._native_turn(prompt_text, messages or [],
+                        model_id=model_id, timeout_seconds=budget, tools=native_tools)
+            else:
+                text, activity = self._run_turn(
+                    prompt_text, model_id=model_id,
+                    timeout_seconds=budget, on_delta=None, attach_mcp=attach_mcp)
+            # In native MCP mode, only a real MCP admission can request host
+            # execution. A final answer quoting XML is ordinary text.
+            admitted = offered if "transport: native-mcp-host-call" in activity else []
+            completion = self._completion_namespace(text, activity, label, admitted,
+                                                     tool_choice=tool_choice)
+            return _completion_to_stream_chunks(completion) if stream else completion
+
+        def _native_turn(self, prompt, messages, *, model_id, timeout_seconds, tools):
+            from gateway.session_context import get_session_env
+            scope = (str(_harness_home().resolve()), self._cwd, _agent_cwd(None),
+                     *(get_session_env(name, '') for name in (
+                         'HERMES_SESSION_ID', 'HERMES_SESSION_KEY', 'HERMES_SESSION_PROFILE')))
+            pending = self._pending_native
+            if pending:
+                if pending.get('scope') != scope:
+                    self.cancel()
+                    raise MuseTurnError('Native caller scope changed; pending turn cancelled, not replayed.')
+                result = next((msg for msg in reversed(messages)
+                    if msg.get('role') == 'tool' and msg.get('tool_call_id') == pending.get('call_id')), None)
+                if result is None or pending['model'] != model_id:
+                    self.cancel()
+                    raise MuseTurnError('Pending native tool call has no matching host result; no replay submitted.')
+                pending['mcp'].tools = {t['function']['name']: t['function'] for t in tools}
+                content = result.get('content')
+                pending['mcp'].results.put({'id': pending['call_id'],
+                    'content': content if isinstance(content, str) else json.dumps(content)})
+                pending['call_id'] = None
+            else:
+                if self._cancel_requested.is_set():
+                    raise MuseTurnError('Muse request cancelled; not submitted.')
+                endpoint = _HostToolMCP(tools)
+                pending = {'mcp': endpoint, 'call_id': None, 'model': model_id, 'scope': scope}
+                self._pending_native = pending
+                def runner():
+                    try:
+                        text, activity = self._run_turn(prompt, model_id=model_id,
+                            timeout_seconds=timeout_seconds, on_delta=None,
+                            attach_mcp=False, host_tools=tools, host_mcp=endpoint)
+                        endpoint.calls.put(('final', (text, activity)))
+                    except BaseException as exc:
+                        endpoint.calls.put(('error', exc))
+                context = contextvars.copy_context()
+                pending['thread'] = threading.Thread(target=context.run, args=(runner,), daemon=True)
+                pending['thread'].start()
+            try:
+                kind, value = pending['mcp'].calls.get(timeout=timeout_seconds + 15)
+            except queue.Empty as exc:
+                self.cancel()
+                raise MuseTurnError('Native MCP request ended without a host call or final result; not replayed.') from exc
+            if kind == 'call':
+                pending['call_id'] = value['id']
+                return '<tool_call>' + json.dumps(value) + '</tool_call>', ['transport: native-mcp-host-call']
+            self._pending_native = None
+            pending['mcp'].close()
+            pending['thread'].join(timeout=2)
+            if kind == 'error':
+                raise value
+            return value
 
         def _completion_namespace(self, text: str, activity: list[str],
-                                  label: str) -> SimpleNamespace:
+                                  label: str, tools=None, *, tool_choice=None) -> SimpleNamespace:
+            calls, cleaned = _extract_tool_calls_from_text(text) if tools else ([], text)
+            allowed = {tool["function"]["name"] for tool in tools or []}
+            if calls and (tool_choice == "none" or any(call.function.name not in allowed for call in calls)):
+                raise MuseTurnError("Muse returned a host tool call outside the offered tool surface; not dispatched.")
             message = SimpleNamespace(
-                content=text, tool_calls=[],
+                content=cleaned, tool_calls=calls,
                 reasoning="\n".join(activity) or None,
                 reasoning_content="\n".join(activity) or None,
                 reasoning_details=None)
             return SimpleNamespace(
                 choices=[SimpleNamespace(message=message,
-                                         finish_reason="stop")],
+                                         finish_reason="tool_calls" if calls else "stop")],
                 usage=SimpleNamespace(
                     prompt_tokens=0, completion_tokens=0, total_tokens=0,
                     prompt_tokens_details=SimpleNamespace(cached_tokens=0)),
@@ -758,18 +1102,23 @@ if _HERMES_AVAILABLE:
 
         def _run_turn(self, prompt_text: str, *, model_id: str,
                       timeout_seconds: float,
-                      on_delta: Callable[[str], None] | None
+                      on_delta: Callable[[str], None] | None,
+                      attach_mcp: bool = True, host_tools=None, host_mcp=None,
                       ) -> tuple[str, list[str]]:
             """MSP first; exec fallback only before a turn can execute."""
+            if self._cancel_requested.is_set():
+                raise MuseTurnError("Muse request was cancelled; not submitted.")
             try:
                 return _msp_turn(
                     prompt_text, model_id=model_id, cwd=self._cwd,
                     timeout_seconds=timeout_seconds, on_delta=on_delta,
-                    track=self._track_msp)
+                    track=self._track_msp, attach_mcp=attach_mcp, host_tools=host_tools, host_mcp=host_mcp)
             except (MusePolicyError, MuseTurnError):
                 # Preserve policy and any actions that may already have happened.
                 raise
             except Exception as exc:  # noqa: BLE001
+                if host_tools:
+                    raise MusePolicyError("Native Hermes MCP tools could not attach; tool-less fallback refused.") from exc
                 logger.warning("muse-code-exec MSP turn failed (%s); "
                                "falling back to muse exec.", exc)
 
@@ -777,9 +1126,15 @@ if _HERMES_AVAILABLE:
                 if on_delta and text:
                     on_delta(text)
 
-            text = run_exec_completion(
-                prompt_text, model=model_id if model_id != PROFILE_NAME
-                else None, cwd=self._cwd, timeout_seconds=timeout_seconds)
+            if self._cancel_requested.is_set():
+                raise MuseTurnError("Muse request was cancelled; exec fallback not submitted.")
+            try:
+                text = run_exec_completion(
+                    prompt_text, model=model_id if model_id != PROFILE_NAME
+                    else None, cwd=self._cwd, timeout_seconds=timeout_seconds,
+                    track=self._track)
+            except Exception as exc:
+                raise MuseTurnError("Muse exec fallback failed; automatic replay was stopped: " + str(exc)) from exc
             _collect(text)
             return text, ["transport: exec-fallback"]
 
@@ -788,16 +1143,19 @@ if _HERMES_AVAILABLE:
             self._track(proc, old)
 
         def _stream_turn(self, prompt_text: str, *, model_id: str,
-                         model_label: str, timeout_seconds: float):
+                         model_label: str, timeout_seconds: float,
+                         attach_mcp: bool = True):
             chunks: queue.Queue = queue.Queue()
             outcome: dict[str, Any] = {}
 
             def _runner():
                 try:
-                    self._run_turn(
+                    text, _ = self._run_turn(
                         prompt_text, model_id=model_id,
                         timeout_seconds=timeout_seconds,
-                        on_delta=lambda t: chunks.put(("delta", t)))
+                        on_delta=lambda t: chunks.put(("delta", t)),
+                        attach_mcp=attach_mcp)
+                    outcome["text"] = text
                     chunks.put(("done", "stop"))
                 except Exception as exc:  # noqa: BLE001
                     outcome["error"] = exc
@@ -808,9 +1166,11 @@ if _HERMES_AVAILABLE:
             context = contextvars.copy_context()
             thread = threading.Thread(target=context.run, args=(_runner,), daemon=True)
             thread.start()
+            emitted = False
             while True:
                 kind, payload = chunks.get()
                 if kind == "delta":
+                    emitted = True
                     yield SimpleNamespace(choices=[SimpleNamespace(
                         index=0, delta=SimpleNamespace(
                             role="assistant", content=payload, tool_calls=None,
@@ -821,6 +1181,11 @@ if _HERMES_AVAILABLE:
             thread.join(timeout=10)
             if outcome.get("error") is not None:
                 raise outcome["error"]
+            if not emitted and outcome.get("text"):
+                yield SimpleNamespace(choices=[SimpleNamespace(
+                    index=0, delta=SimpleNamespace(role="assistant", content=outcome["text"],
+                    tool_calls=None, reasoning_content=None, reasoning=None), finish_reason=None)],
+                    model=model_label, usage=None)
             yield SimpleNamespace(choices=[SimpleNamespace(
                 index=0, delta=SimpleNamespace(
                     role="assistant", content=None, tool_calls=None,
@@ -843,6 +1208,7 @@ if _HERMES_AVAILABLE:
         process_args=("serve",),
         process_command_env_vars=ENV_COMMAND_VARS,
         fallback_models=("muse-spark-1.3",),
+        classify_api_error=_classify_muse_error,
     )
 
     register_provider(muse_code_exec)
