@@ -380,6 +380,15 @@ def _agent_cwd(exec_cwd: str | None) -> str:
         return str(Path(exec_cwd or os.path.expanduser("~")).resolve())
 
 
+def _native_scope_cwd() -> str:
+    """Logical workspace identity survives managed scratch cleanup after a tool."""
+    try:
+        from agent.runtime_cwd import scoped_session_cwd, scope_terminal_cwd
+    except ImportError:
+        return _agent_cwd(None)
+    return scoped_session_cwd() or scope_terminal_cwd() or _agent_cwd(None)
+
+
 def login_healthy(timeout: float = 20.0) -> bool:
     """True when the Muse subscription login works (no inference spent)."""
     try:
@@ -684,7 +693,7 @@ def _initialize_params() -> dict[str, Any]:
     """MSP handshake: identity plus the sessionMcp capability that admits
     `config.mcpServers` on session/start (stable surface)."""
     return {"clientInfo": {
-        "name": "hermes_muse_code_exec", "version": "0.5.2"},
+        "name": "hermes_muse_code_exec", "version": "0.5.3"},
         "capabilities": {"requestedCapabilities": ["sessionMcp"]}}
 
 
@@ -1031,7 +1040,7 @@ if _HERMES_AVAILABLE:
 
         def _native_turn(self, prompt, messages, *, model_id, timeout_seconds, tools):
             from gateway.session_context import get_session_env
-            scope = (str(_harness_home().resolve()), self._cwd, _agent_cwd(None),
+            scope = (str(_harness_home().resolve()), self._cwd, _native_scope_cwd(),
                      *(get_session_env(name, '') for name in (
                          'HERMES_SESSION_ID', 'HERMES_SESSION_KEY', 'HERMES_SESSION_PROFILE')))
             pending = self._pending_native
