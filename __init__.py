@@ -684,7 +684,7 @@ def _initialize_params() -> dict[str, Any]:
     """MSP handshake: identity plus the sessionMcp capability that admits
     `config.mcpServers` on session/start (stable surface)."""
     return {"clientInfo": {
-        "name": "hermes_muse_code_exec", "version": "0.5.1"},
+        "name": "hermes_muse_code_exec", "version": "0.5.2"},
         "capabilities": {"requestedCapabilities": ["sessionMcp"]}}
 
 
@@ -1194,7 +1194,7 @@ if _HERMES_AVAILABLE:
 
     muse_code_exec = MuseCodeExecProfile(
         name=PROFILE_NAME,
-        display_name="Muse Code (subscription)",
+        display_name="Muse Bridge",
         description="Muse Spark billed to the Muse Code monthly login "
                     "via the attested CLI (MSP session, exec fallback)",
         signup_url="https://github.com/TheStreamCode/hermes-muse-code",
