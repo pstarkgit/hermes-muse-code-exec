@@ -267,6 +267,43 @@ def test_turn_preamble_present_and_safe():
     assert "disable sandbox" in lowered
 
 
+def test_identity_stays_brief_without_runtime_lecture():
+    module, _ = _load_plugin()
+    lowered = module.TURN_PREAMBLE.lower()
+    assert "one short sentence" in lowered
+    assert "never lecture" in lowered
+    assert "transport only" in lowered
+
+
+def test_coerce_text_shapes():
+    module, _ = _load_plugin()
+    assert module._coerce_text(None) == ""
+    assert module._coerce_text("You are Kira.") == "You are Kira."
+    assert module._coerce_text(
+        [{"type": "text", "text": "A"},
+         {"type": "image", "text": "B"}]) == "A"
+
+
+def test_system_kwarg_carried_into_prompt():
+    module, _ = _load_plugin()
+    client = module.MuseCodeExecClient()
+    seen = {}
+
+    def fake_run(prompt_text, **kwargs):
+        seen["prompt"] = prompt_text
+        return ("ok", [])
+
+    with patch.object(module.MuseCodeExecClient, "_run_turn",
+                       side_effect=fake_run):
+        out = client._create_chat(
+            model="muse-spark-1.3",
+            messages=[{"role": "user", "content": "hi"}],
+            system="You are Kira.")
+    assert "System (bot identity" in seen["prompt"]
+    assert "You are Kira." in seen["prompt"]
+    assert out.choices[0].message.content == "ok"
+
+
 def test_model_id_passed_through():
     module, _ = _load_plugin()
     seen = {}

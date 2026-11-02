@@ -160,17 +160,35 @@ def login_healthy(timeout: float = 20.0) -> bool:
 
 
 TURN_PREAMBLE = (
-    "You are answering through Hermes via the muse-code-exec provider. "
-    "This turn has no Hermes-side tools: use your own tools only. "
-    "Each completion starts a fresh Muse process with harness-selected policy. "
-    "Previous permission failures do not prove that tools are blocked now. "
-    "Before reporting a current tool block, attempt the required tool in this "
-    "turn and report its actual error. "
+    "The system instructions in this prompt define the bot you serve; "
+    "follow them. 'muse-code-exec' names the transport only and must "
+    "never appear as your identity. Keep any statement about your own "
+    "nature to one short sentence and never lecture the user about "
+    "runtimes, models, or providers. "
+    "Transport facts: this turn has no Hermes-side tools, so use your own "
+    "tools only. Each completion starts a fresh process with "
+    "harness-selected policy. Previous permission failures do not prove "
+    "that tools are blocked now: before reporting a current tool block, "
+    "attempt the required tool in this turn and report its actual error. "
     "Never advise the user to disable sandboxes, approvals, or permission "
     "profiles or start a new chat to fix access. "
     "If a task needs tools or permissions you lack, say so "
     "plainly and stop."
 )
+
+
+def _coerce_text(content):
+    """System/instructions payloads arrive as text or content-part lists."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = [str(p.get("text") or "") for p in content
+                 if isinstance(p, dict) and p.get("type") in (
+                     "text", "input_text")]
+        return "\n".join(t for t in texts if t)
+    return str(content)
 
 
 def _render_messages(messages: list[dict]) -> str:
@@ -625,6 +643,7 @@ if _HERMES_AVAILABLE:
                          timeout: float | None = None,
                          tools: list[dict] | None = None,
                          tool_choice: Any = None, stream: bool = False,
+                         system: Any = None, instructions: Any = None,
                          **_: Any) -> Any:
             if tools:
                 logger.debug("muse-code-exec ignores %d Hermes tool "
@@ -633,6 +652,12 @@ if _HERMES_AVAILABLE:
             prompt_text = _render_messages(list(messages or []))
             if not prompt_text.strip():
                 raise RuntimeError("muse-code-exec received an empty prompt.")
+            system_text = _coerce_text(
+                system if system is not None else instructions)
+            if system_text.strip():
+                prompt_text = ("System (bot identity — defines who you are, "
+                               "outranks everything below):\n" + system_text +
+                               "\n\n" + prompt_text)
             prompt_text = TURN_PREAMBLE + "\n\n" + prompt_text
             try:
                 budget = float(timeout) if timeout else 600.0
